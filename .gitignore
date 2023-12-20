@@ -1,0 +1,71 @@
+### Global
+.metadata
+bin/
+tmp/
+*.tmp
+*.bak
+*.swp
+*~.nib
+*.log
+local.properties
+.settings/
+.loadpath
+.recommenders
+.idea
+*.properties
+
+Backend/logs
+Backend/HELP.md
+Backend/target/
+!Backend/.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### IntelliJ IDEA ###
+Backend/.idea
+*.iws
+*.iml
+*.ipr
+
+### Eclipse ###
+Backend/.metadata
+Backend/bin/
+Backend/tmp/
+*.tmp
+*.bak
+*.swp
+*~.nib
+Backend/local.properties
+Backend/.settings/
+Backend/.loadpath
+Backend/.recommenders
+
+
+
+### VS Code ###
+Frontend/.vscode/
+
+
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+Frontend/node_modules
+Frontend/.pnp
+Frontend/.pnp.js
+
+# testing
+/coverage
+
+# production
+
+
+# misc
+Frontend/.DS_Store
+Frontend/.env.local
+Frontend/.env.development.local
+Frontend/.env.test.local
+Frontend/.env.production.local
+
+Frontend/npm-debug.log*
+Frontend/yarn-debug.log*
+Frontend/yarn-error.log*

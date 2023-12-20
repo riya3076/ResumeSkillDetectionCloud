@@ -1,0 +1,1490 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  SNSTopicArn:
+    Type: String
+    Description: ARN of the SNS Topic for email subscription
+    Default: AWS::NoValue
+
+Resources:
+
+  userDetails:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const  AWS =  require('aws-sdk');
+ 
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+          const s3 = new AWS.S3();
+
+          const tableName = 'userdetails';
+          const bucketName = 'b00926204applicantsresumes';
+          const headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Credentials': true,
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+          };
+
+          exports.handler = async (event) => {
+            try {
+              const { applicationId, name, job_id, mobile, email, answer, resume } = JSON.parse(event.body);
+            const resumeDataBuffer = Buffer.from(resume, "base64");
+            
+            
+              const resumeKey = `resumes/${applicationId}.pdf`;
+              const s3Params = {
+                Bucket: bucketName,
+                Key: resumeKey,
+                Body: resumeDataBuffer,
+                ContentType: 'application/pdf', 
+              
+              };
+
+              await s3.upload(s3Params).promise();
+
+              const dynamoParams = {
+                TableName: tableName,
+                Item: {
+                  applicationId,
+                  job_id,
+                  name,
+                  mobile,
+                  email,
+                  answer,
+                  resumeUrl: `https://${bucketName}.s3.amazonaws.com/${resumeKey}`,
+                },
+              };
+
+              await dynamoDB.put(dynamoParams).promise();
+
+              return {
+                statusCode: 200,
+                headers,
+                body: JSON.stringify({ message: 'Application submitted successfully', applicationId }),
+              };
+            } catch (error) {
+              console.error('Error submitting application:', error);
+
+              return {
+                statusCode: 500,
+                headers,
+                body: JSON.stringify({ message: `Error submitting application: ${error.message}` }),
+              };
+            }
+          };
+
+
+      Handler: index.handler
+      Role: arn:aws:iam::963848756168:role/LabRole
+      Runtime: nodejs16.x
+      Timeout: 30
+
+  
+  userDetailsRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: userDetailsRestApi
+
+  userDetailsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref userDetailsRestApi
+      ParentId: !GetAtt userDetailsRestApi.RootResourceId
+      PathPart: "userdetails"
+
+  userDetailsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref userDetailsRestApi
+      ResourceId: !Ref userDetailsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${userDetails.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  userDetailsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref userDetailsRestApi
+      ResourceId: !Ref userDetailsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  userDetailsDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - userDetailsMethod
+      - userDetailsOptionsMethod
+    Properties:
+      RestApiId: !Ref userDetailsRestApi
+      StageName: "prod"
+
+  userDetailsUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/userdetails"
+      Description: API Gateway URL storing user details.
+      Type: String
+      Value: !Sub "https://${userDetailsRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  UserDetails:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: userdetails
+      AttributeDefinitions:
+        - AttributeName: applicationId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: applicationId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  MyLambdaPermissionApiGatewayUserDetailsPost:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref userDetails
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${userDetailsRestApi}/*/*/*"
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: interviewEmail
+
+  subscribeMail:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+
+          const sns = new AWS.SNS();
+          const snsTopicArn = process.env.SNSTopicArn || process.env.SNSTopic;
+
+          exports.handler = async (event, context) => {
+            try{
+            const { email } = JSON.parse(event.body);
+
+              const subscribeParams = {
+                  Protocol: "email",
+                  TopicArn: snsTopicArn, 
+                  Endpoint: email,
+                  Attributes: {
+                    FilterPolicy: JSON.stringify({ email: [email] }),
+                  },
+                };
+                
+                await sns.subscribe(subscribeParams).promise();
+
+              
+                console.log('No document with the specified email found.');
+                const headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+              };
+                return {
+                  statusCode: 201,
+                  headers,
+                  body: JSON.stringify({
+                    message:
+                      "Signup successful. Please check your email for confirmation message.",
+                  }),
+                };
+            }
+            catch (error) {
+              console.error("Error:", error);
+              const headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+              };
+              return {
+                statusCode: 500,
+                headers,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          };
+
+
+
+      Handler: index.handler
+      Role: arn:aws:iam::963848756168:role/LabRole
+      Runtime: nodejs16.x
+      Timeout: 30
+      Environment:
+        Variables:
+          SNSTopicArn:
+            Ref: SNSTopic
+
+  subscribeMailRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: subscribeMailRestApi
+
+  subscribeMailResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref subscribeMailRestApi
+      ParentId: !GetAtt subscribeMailRestApi.RootResourceId
+      PathPart: "subscribemail"
+
+  subscribeMailMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref subscribeMailRestApi
+      ResourceId: !Ref subscribeMailResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${subscribeMail.Arn}/invocations"
+        PassthroughBehavior: NEVER
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  subscribeMailOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref subscribeMailRestApi
+      ResourceId: !Ref subscribeMailResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  subscribeMailDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - subscribeMailMethod
+      - subscribeMailOptionsMethod
+    Properties:
+      RestApiId: !Ref subscribeMailRestApi
+      StageName: "prod"
+
+  subscribeMailUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/subscribemail"
+      Description: API Gateway URL for mail subscription.
+      Type: String
+      Value: !Sub "https://${subscribeMailRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  MyLambdaPermissionApiGatewaysubscribeMailPost:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref subscribeMail
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${subscribeMailRestApi}/*/*/*"
+
+  MyS3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: b00926204applicantsresumes
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+  MyBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: 
+        Ref: MyS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal: '*'
+            Action: 
+              - 's3:GetObject'
+              - 's3:PutObject'
+            Resource: 
+              Fn::Sub: arn:aws:s3:::${MyS3Bucket}/*
+
+  jobposting:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const  AWS =  require('aws-sdk');
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event) => {
+            try {
+              const {job_id,  job_experience, job_location, job_title, skills} = JSON.parse(event.body) ;
+              
+              const jobData = {
+                job_id,
+                job_experience,
+                job_location,
+                job_title ,
+                skills: Array.from(skills),
+              };
+              const headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+              };
+              
+              console.log(jobData);
+              const params = {
+                TableName: 'jobopenings',
+              
+                Item: jobData,
+              };
+
+              await dynamoDB.put(params).promise();
+
+              return {
+                statusCode: 200,
+                  headers,
+                body: JSON.stringify({ message: 'Job data submitted successfully' }),
+              };
+            } catch (error) {
+              console.error('Error submitting job data:', error);
+              const headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+              };
+              return {
+                statusCode: 500,
+                headers,
+                body: JSON.stringify({ message: 'Internal server error' }),
+              };
+            }
+          };
+
+
+
+
+      Handler: index.handler
+      Role: arn:aws:iam::963848756168:role/LabRole
+      Runtime: nodejs16.x
+      Timeout: 30
+
+  JobPostingRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: JobPostingRestApi
+
+  JobPostingResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref JobPostingRestApi
+      ParentId: !GetAtt JobPostingRestApi.RootResourceId
+      PathPart: "jobposting"
+
+  JobPostingMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref JobPostingRestApi
+      ResourceId: !Ref JobPostingResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${jobposting.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  JobPostingOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref JobPostingRestApi
+      ResourceId: !Ref JobPostingResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  JobPostingDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - JobPostingMethod
+      - JobPostingOptionsMethod
+    Properties:
+      RestApiId: !Ref JobPostingRestApi
+      StageName: "prod"
+
+  JobPostingUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/jobposting"
+      Description: API Gateway URL for job posting.
+      Type: String
+      Value: !Sub "https://${JobPostingRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  JobPosting:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: jobopenings
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  MyLambdaPermissionApiGatewayJobPosting:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref jobposting
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${JobPostingRestApi}/*/*/*"
+
+  GetJobData:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event, context) => {
+            try {
+              const params = {
+                TableName: 'jobopenings',
+              };
+
+              const data = await dynamoDB.scan(params).promise();
+
+              const headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+              };
+
+              return {
+                statusCode: 200,
+                headers,
+                body: JSON.stringify(data), // Convert data to JSON string
+              };
+            } catch (error) {
+              console.error('Error fetching data from DynamoDB', error);
+
+              const headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+              };
+
+              return {
+                statusCode: 500,
+                headers,
+                body: JSON.stringify({ message: 'Internal Server Error' }),
+              };
+            }
+          };
+
+      Handler: index.handler
+      Role: arn:aws:iam::963848756168:role/LabRole
+      Runtime: nodejs16.x
+      Timeout: 30
+
+
+  getJobdata:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: getJobdata
+
+  getJobdataResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref getJobdata
+      ParentId: !GetAtt getJobdata.RootResourceId
+      PathPart: getjobdata
+
+  getJobdataMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref getJobdata
+      ResourceId: !Ref getJobdataResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetJobData.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  getJobdataOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref getJobdata
+      ResourceId: !Ref getJobdataResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+
+  getJobdataDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:  getJobdataMethodGet
+    Properties:
+      RestApiId: !Ref getJobdata
+
+  getJobdataStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: getJobdataDeployment
+    Properties:
+      StageName: prod
+      RestApiId: !Ref getJobdata
+      DeploymentId: !Ref getJobdataDeployment
+
+  MyLambdaPermissionApiGatewayGetAll:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetJobData
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${getJobdata}/*/*/*"
+
+  getJobdataUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/getjobdata"
+      Description: API Gateway URL get job data.
+      Type: String
+      Value: !Sub "https://${getJobdata}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  extractSkills:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const  AWS =  require('aws-sdk');
+          const textract = new AWS.Textract();
+          const s3 = new AWS.S3();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event, context, callback) => {
+            const {applicationId} = JSON.parse(event.body);
+            console.log(event)
+            const tableName = 'jobopenings';
+            const usertable = 'userdetails';
+            const extractedDataTableName = 'extractedData';
+            
+            console.log(applicationId);
+            try {
+                
+                const userTableParams = { 
+                TableName: usertable,
+                Key: {
+                  applicationId: applicationId,
+                },
+              };
+
+              const userTableResult = await dynamodb.get(userTableParams).promise();
+              console.log(userTableResult);
+              if (!userTableResult.Item || !userTableResult.Item.job_id) {
+                throw new Error('No job_id found for the given applicationId.');
+              }
+
+              const jobId = userTableResult.Item.job_id;
+              console.log(`JobID ${jobId}`);
+
+              const s3Params = {
+                Bucket: 'b00926204applicantsresumes',
+                Key: `resumes/${applicationId}.pdf`
+              };
+
+              const data = await s3.getObject(s3Params).promise();
+
+              const textractParams = {
+                Document: {
+                  Bytes: data.Body,
+                },
+              };
+
+              const textractResult = await textract.detectDocumentText(textractParams).promise();
+
+              const extractedSkills = extractSkillsFromTextractResult(textractResult).map(skill => skill.toLowerCase());
+
+              const dynamoDBParams = {
+              TableName: tableName,
+              Key: {
+                job_id: jobId,
+              },
+            };
+
+              const dynamoDBResult = await dynamodb.get(dynamoDBParams).promise();
+              console.log('DynamoDB Result:', dynamoDBResult);
+              
+            const skillsInDynamoDB = dynamoDBResult.Item.skills.map(skill => skill.toLowerCase());
+            console.log('Skills in DynamoDB:', skillsInDynamoDB);
+
+
+              const matchingSkillsSet = new Set(extractedSkills.filter(skill => skillsInDynamoDB.includes(skill)));
+              
+              const matchingSkills = [...matchingSkillsSet];
+              
+              console.log('Matching Skills:', matchingSkills);
+            
+                const extractedDataParams = {
+                TableName: extractedDataTableName,
+                Item: {
+                  applicationId: applicationId,
+                  matchingSkills: matchingSkills,
+                },
+              };
+
+              await dynamodb.put(extractedDataParams).promise();
+              const headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+              };
+
+              callback(null, {
+                statusCode: 200,
+                headers,
+                body: JSON.stringify({
+                  message: 'Success',
+                
+                  matchingSkills: matchingSkills,
+                }),
+              });
+            } catch (error) {
+              console.error('Error:', error);
+              const headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+              };
+              callback(error, {
+                  headers,
+                statusCode: 500,
+                body: JSON.stringify({
+                  message: 'Error',
+                
+                  error: error.message,
+                }),
+              });
+            }
+          };
+
+          function extractSkillsFromTextractResult(textractResult) {
+            const blocks = textractResult.Blocks;
+
+            const skillsIndex = blocks.findIndex(block => block.Text && block.Text.toLowerCase().includes('skills'));
+              
+            if (skillsIndex !== -1) {
+              const wordsAfterSkills = blocks
+                .slice(skillsIndex + 1) 
+                .filter(block => block.BlockType === 'WORD')
+                .map(wordBlock => wordBlock.Text);
+              return wordsAfterSkills || []; 
+            } else {
+              console.log('No "Skills" block found.');
+              return [];
+            }
+          }
+
+
+
+      Handler: index.handler
+      Role: arn:aws:iam::963848756168:role/LabRole
+      Runtime: nodejs16.x
+      Timeout: 30
+
+  
+  extractSkillsRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: extractSkillsRestApi
+
+  extractSkillsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref extractSkillsRestApi
+      ParentId: !GetAtt extractSkillsRestApi.RootResourceId
+      PathPart: "extractskills"
+
+  extractSkillsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref extractSkillsRestApi
+      ResourceId: !Ref extractSkillsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${extractSkills.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  extractSkillsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref extractSkillsRestApi
+      ResourceId: !Ref extractSkillsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  extractSkillsDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - extractSkillsMethod
+      - extractSkillsOptionsMethod
+    Properties:
+      RestApiId: !Ref extractSkillsRestApi
+      StageName: "prod"
+
+  extractSkillsUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/extractskills"
+      Description: API Gateway URL for extract skills.
+      Type: String
+      Value: !Sub "https://${extractSkillsRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  MyLambdaPermissionApiGatewayextractSkillsPost:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref extractSkills
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${extractSkillsRestApi}/*/*/*"
+
+  ExtractedDetails:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: extractedData
+      AttributeDefinitions:
+        - AttributeName: applicationId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: applicationId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  applicantDetails:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+          const s3 = new AWS.S3();
+
+          exports.handler = async (event) => {
+            const {applicationId} = JSON.parse(event.body); 
+
+            if (!applicationId) {
+              return {
+                statusCode: 400,
+                headers: {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Credentials': true,
+                },
+                body: JSON.stringify({ error: 'Missing applicationId parameter' }),
+              };
+            }
+
+            const params = {
+              TableName: 'extractedData',
+              Key: {
+                applicationId,
+              },
+            };
+
+            try {
+              const result = await dynamoDB.get(params).promise();
+              const resumeUrl = `https://b00926204applicantsresumes.s3.amazonaws.com/resumes/${applicationId}.pdf`;
+              if (!result.Item || !result.Item.matchingSkills || !result.Item.matchingSkills.length) {
+                return {
+                  statusCode: 200,
+                  headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Credentials': true,
+                  },
+                  body: JSON.stringify({ matchingSkills:  result.Item.matchingSkills,resumeUrl }),
+                };
+              }
+
+              
+
+              return {
+                statusCode: 200,
+                headers: {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Credentials': true,
+                },
+                body: JSON.stringify({ matchingSkills: result.Item.matchingSkills, resumeUrl }),
+              };
+            } catch (error) {
+              console.error('Error fetching expected skills:', error);
+              return {
+                statusCode: 500,
+                headers: {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Credentials': true,
+                },
+                body: JSON.stringify({ error: 'Internal Server Error' }),
+              };
+            }
+          };
+
+
+
+      Handler: index.handler
+      Role: arn:aws:iam::963848756168:role/LabRole
+      Runtime: nodejs16.x
+      Timeout: 30
+
+  ApplicantDetailsRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ApplicantDetailsRestApi
+
+  ApplicantDetailsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApplicantDetailsRestApi
+      ParentId: !GetAtt ApplicantDetailsRestApi.RootResourceId
+      PathPart: "applicantdetails"
+
+  ApplicantDetailsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApplicantDetailsRestApi
+      ResourceId: !Ref ApplicantDetailsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${applicantDetails.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  ApplicantDetailsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApplicantDetailsRestApi
+      ResourceId: !Ref ApplicantDetailsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ApplicantDetailsDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApplicantDetailsMethod
+      - ApplicantDetailsOptionsMethod
+    Properties:
+      RestApiId: !Ref ApplicantDetailsRestApi
+      StageName: "prod"
+
+  MyLambdaPermissionApiGatewayApplicationDetails:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref applicantDetails
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApplicantDetailsRestApi}/*/*/*"
+
+  ApplicantDetailsUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/applicantdetails"
+      Description: API Gateway URL for applicant details.
+      Type: String
+      Value: !Sub "https://${ApplicantDetailsRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  GetApplication:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+          exports.handler = async (event, context) => {
+
+            // Define your DynamoDB table name
+            const tableName = 'userdetails';
+
+            const params = {
+              TableName: tableName,
+            };
+
+            try {
+              const result = await dynamoDB.scan(params).promise();
+
+              const applicants = result.Items.map((item) => ({
+                applicationId: item.applicationId,
+                name: item.name,
+                email: item.email,
+                mobile: item.mobile,
+                answer: item.answer,
+                resumeUrl: item.resumeUrl,
+              }));
+
+              return {
+                statusCode: 200,
+                headers: {
+                        'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+                },
+                body: JSON.stringify(applicants),
+              };
+            } catch (error) {
+              console.error('Error scanning DynamoDB table:', error);
+
+              return {
+                statusCode: 500,
+                headers: {
+                        'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+                },
+                body: JSON.stringify({ error: 'Internal Server Error' }),
+              };
+            }
+          };
+
+
+
+      Handler: index.handler
+      Role: arn:aws:iam::963848756168:role/LabRole
+      Runtime: nodejs16.x
+      Timeout: 30
+
+
+  getApplication:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: getApplication
+
+  getApplicationResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref getApplication
+      ParentId: !GetAtt getApplication.RootResourceId
+      PathPart: getApplication
+
+  getApplicationMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref getApplication
+      ResourceId: !Ref getApplicationResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetApplication.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  getApplicationOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref getApplication
+      ResourceId: !Ref getApplicationResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+
+  getApplicationDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:  getApplicationMethodGet
+    Properties:
+      RestApiId: !Ref getApplication
+
+  getApplicationStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: getApplicationDeployment
+    Properties:
+      StageName: prod
+      RestApiId: !Ref getApplication
+      DeploymentId: !Ref getApplicationDeployment
+
+  MyLambdaPermissionApiGatewayGetApplication:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetApplication
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${getApplication}/*/*/*"
+
+  getApplicationUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/getApplication"
+      Description: API Gateway URL for getting applicant details.
+      Type: String
+      Value: !Sub "https://${getApplication}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  SendMail:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const sns = new AWS.SNS();
+          const snsTopicArn = process.env.SNSTopicArn || process.env.SNSTopic;
+
+          exports.handler = async (event, context) => {
+            console.log(event.body);
+            try{
+              
+              const { email } = JSON.parse(event.body);
+            
+              const SuccessMessage = `Congratulation , You are selected for interview! , Please reply in this mail, when are you comfortable? `;
+                const snsLoginSuccessParams = {
+                  Message: SuccessMessage,
+                  Subject: "Interview Mail",
+                  TopicArn: snsTopicArn,
+                  MessageAttributes: {  
+                    email: {
+                      DataType: "String",
+                      StringValue: email,
+                    },
+                  },
+                };
+                const headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+              };
+                await sns.publish(snsLoginSuccessParams).promise();
+                return {
+                  statusCode: 200,
+                  headers,
+                  body: JSON.stringify({
+                    message:
+                      "Interview mail send successfully",
+                  }),
+                };
+              
+            }
+            catch (error) {
+              const headers = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Credentials': true,
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Allow-Methods': 'OPTIONS, POST, GET',
+              };
+              console.error("Error:", error);
+              return {
+                statusCode: 500,
+                headers,
+                body: JSON.stringify({ message: "Internal Server Error" }),
+              };
+            }
+          }
+
+
+
+
+
+      Handler: index.handler
+      Role: arn:aws:iam::963848756168:role/LabRole
+      Runtime: nodejs16.x
+      Timeout: 30
+      Environment:
+        Variables:
+          SNSTopicArn:
+            Ref: SNSTopic
+
+  SendMailRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: SendMailRestApi
+
+  SendMailResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SendMailRestApi
+      ParentId: !GetAtt SendMailRestApi.RootResourceId
+      PathPart: "SendMail"
+
+  SendMailMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SendMailRestApi
+      ResourceId: !Ref SendMailResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMail.Arn}/invocations"
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+
+  SendMailOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SendMailRestApi
+      ResourceId: !Ref SendMailResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  SendMailDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SendMailMethod
+      - SendMailOptionsMethod
+    Properties:
+      RestApiId: !Ref SendMailRestApi
+      StageName: "prod"
+
+  MyLambdaPermissionApiGatewaySendMail:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SendMail
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SendMailRestApi}/*/*/*"
+
+  SendMailUrlParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/sendMail"
+      Description: API Gateway URL for sending mail.
+      Type: String
+      Value: !Sub "https://${SendMailRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  EC2InstanceAdmin:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0f34c5ae932e6f0e4
+      InstanceType: t2.large
+      KeyName: myfirstec2
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          sudo su
+          yum -y install nodejs
+          yum install -y aws-cli
+          aws configure set aws_access_key_id "ASIA6A2O43PEOMEI6VWN"
+          aws configure set aws_secret_access_key "W1PFlomAFA0QXZaoOdv+jMVFIsx8z4IB6N7LDG1Z" 
+          aws configure set aws_session_token "FwoGZXIvYXdzEBAaDG6wBcSORePQOhPIDyLAAdM2N1krTkSb9qXP3006t3J7DRx1k3tAoXcp+hDQ72Y4cVZr2VBtHVu6i1V2a61WThvPfINwdpmfiPONlKuPRtPL4M+IYSx+6ycdIO/mrEe04xzvLT3Xgt4k5JMWhHzY4zbrHDvZeFZFKh0/zk0axX53O3+SCRAOFEaH91W3n/zrp9rxvwfFQZOoZDfJ4bnSY6ChZDWpef4an+T05SHvYOzew9CkIgKKHYGhCRmEPgb21P9qWlFCI9fceTbhpoQ9TSiIrLmrBjItYxD3DlD1VKlW6Rhgwnjfyx5N+kUqNo40P5/V02s2YJZgKSifMlHTuyNWJxmf"
+          echo "Starting script execution..." 
+          aws s3 cp s3://cloud-frontend-00926204/Admin/ /home/ec2-user --recursive
+          cd /home/ec2-user
+          npm install
+          npm start
+
+  EC2InstanceUser:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0f34c5ae932e6f0e4
+      InstanceType: t2.large
+      KeyName: myfirstec2
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+          sudo su
+          yum -y install nodejs
+          yum install -y aws-cli
+          aws configure set aws_access_key_id "ASIA6A2O43PEOMEI6VWN"
+          aws configure set aws_secret_access_key "W1PFlomAFA0QXZaoOdv+jMVFIsx8z4IB6N7LDG1Z" 
+          aws configure set aws_session_token "FwoGZXIvYXdzEBAaDG6wBcSORePQOhPIDyLAAdM2N1krTkSb9qXP3006t3J7DRx1k3tAoXcp+hDQ72Y4cVZr2VBtHVu6i1V2a61WThvPfINwdpmfiPONlKuPRtPL4M+IYSx+6ycdIO/mrEe04xzvLT3Xgt4k5JMWhHzY4zbrHDvZeFZFKh0/zk0axX53O3+SCRAOFEaH91W3n/zrp9rxvwfFQZOoZDfJ4bnSY6ChZDWpef4an+T05SHvYOzew9CkIgKKHYGhCRmEPgb21P9qWlFCI9fceTbhpoQ9TSiIrLmrBjItYxD3DlD1VKlW6Rhgwnjfyx5N+kUqNo40P5/V02s2YJZgKSifMlHTuyNWJxmf"
+          echo "Starting script execution..." 
+          aws s3 cp s3://cloud-b00926204-user/User/ /home/ec2-user --recursive
+          cd /home/ec2-user
+          npm install
+          npm start
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the EC2 instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+
+Outputs: 
+  WebsiteURLAdmin:
+    Description: URL for accessing admin App
+    Value: !Join
+      - ""
+      - - "http://"
+        - !GetAtt EC2InstanceAdmin.PublicIp
+        - ":3000"
+
+  WebsiteURLUser:
+    Description: URL for accessing admin App
+    Value: !Join
+      - ""
+      - - "http://"
+        - !GetAtt EC2InstanceUser.PublicIp
+        - ":3000"
+  
+
+  
+
